@@ -21,6 +21,7 @@ if grep -q '^#\?PasswordAuthentication' "$SSH_CONFIG_FILE"; then
   echo "Updating PasswordAuthentication setting to 'no'"
   sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "$SSH_CONFIG_FILE"
 else
+  echo "Adding PasswordAuthentication no to the configuration file"
   echo "PasswordAuthentication no" >> "$SSH_CONFIG_FILE"
 fi
 
@@ -29,6 +30,7 @@ if grep -q '^#\?ChallengeResponseAuthentication' "$SSH_CONFIG_FILE"; then
   echo "Updating ChallengeResponseAuthentication setting to 'no'"
   sed -i 's/^#\?ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' "$SSH_CONFIG_FILE"
 else
+  echo "Adding ChallengeResponseAuthentication no to the configuration file"
   echo "ChallengeResponseAuthentication no" >> "$SSH_CONFIG_FILE"
 fi
 
@@ -37,6 +39,7 @@ if grep -q '^#?PubkeyAuthentication' "$SSH_CONFIG_FILE"; then
   echo "Updating PubkeyAuthentication setting to 'yes'"
   sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$SSH_CONFIG_FILE"
 else
+  echo "Setting PubkeyAuthentication to 'yes'"
   echo "PubkeyAuthentication yes" >> "$SSH_CONFIG_FILE"
 fi
 
