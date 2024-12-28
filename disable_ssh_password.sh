@@ -17,7 +17,7 @@ echo "Backing up SSH configuration to $BACKUP_FILE"
 cp "$SSH_CONFIG_FILE" "$BACKUP_FILE"
 
 # Update the configuration to disable password authentication
-if grep -q '^#?PasswordAuthentication' "$SSH_CONFIG_FILE"; then
+if grep -q '^#\?PasswordAuthentication' "$SSH_CONFIG_FILE"; then
   echo "Updating PasswordAuthentication setting to 'no'"
   sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "$SSH_CONFIG_FILE"
 else
@@ -25,7 +25,7 @@ else
 fi
 
 # Ensure ChallengeResponseAuthentication is disabled
-if grep -q '^#?ChallengeResponseAuthentication' "$SSH_CONFIG_FILE"; then
+if grep -q '^#\?ChallengeResponseAuthentication' "$SSH_CONFIG_FILE"; then
   echo "Updating ChallengeResponseAuthentication setting to 'no'"
   sed -i 's/^#\?ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' "$SSH_CONFIG_FILE"
 else
