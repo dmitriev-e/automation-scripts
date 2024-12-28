@@ -35,7 +35,7 @@ else
 fi
 
 # Enable public key authentication
-if grep -q '^#?PubkeyAuthentication' "$SSH_CONFIG_FILE"; then
+if grep -q '^#\?PubkeyAuthentication' "$SSH_CONFIG_FILE"; then
   echo "Updating PubkeyAuthentication setting to 'yes'"
   sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$SSH_CONFIG_FILE"
 else
