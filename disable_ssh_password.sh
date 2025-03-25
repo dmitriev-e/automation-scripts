@@ -14,7 +14,7 @@ SSH_CONFIG_FILE="/etc/ssh/sshd_config"
 # Backup the SSH configuration file
 BACKUP_FILE="${SSH_CONFIG_FILE}.bak.$(date +%F)"
 echo "Backing up SSH configuration to $BACKUP_FILE"
-cp "$SSH_CONFIG_FILE" "$BACKUP_FILE"
+cp "$SSH_CONFIG_FILE" "$BACKUP_FILE" || { echo "Failed to create backup"; exit 1; }
 
 # Update the configuration to disable password authentication
 if grep -q '^#\?PasswordAuthentication' "$SSH_CONFIG_FILE"; then
