@@ -13,6 +13,11 @@ set -u
 #   ./multinc.sh -h example.com -p 443 -c 100 -t 1 -i 20
 #   ./multinc.sh -h 10.0.0.5 -p 3306 -c 50 -t 2 -n
 #
+# On SUCCESS, prints TCP connect time in ms using bash/GNU date only (no Python):
+#   - Bash 5.1+ built-in EPOCHREALTIME when available
+#   - else GNU date +%s%N (typical Linux)
+#   - else no timing line (plain SUCCESS)
+#
 # Exit codes:
 #   0: all attempts succeeded
 #   1: at least one attempt failed
@@ -54,6 +59,36 @@ is_pos_int() { [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]; }
 is_nonneg_int() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# Runs nc with given args; prints connect time in ms (one line) to stdout; exit code = nc's exit code.
+# Timing: bash EPOCHREALTIME (5.1+), else GNU date +%s%N; else no stdout line (caller prints SUCCESS only).
+run_nc_timed() {
+  if [[ "${BASH_VERSINFO[0]:-0}" -ge 5 ]] && [[ -n "${EPOCHREALTIME+x}" ]]; then
+    local t0="$EPOCHREALTIME" t1 rc
+    nc "$@" >/dev/null 2>&1
+    rc=$?
+    t1="$EPOCHREALTIME"
+    awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f\n", (b - a) * 1000.0 }'
+    return "$rc"
+  fi
+
+  local start end rc delta_ns
+  start="$(date +%s%N 2>/dev/null || true)"
+  if [[ "$start" =~ ^[0-9]+$ ]] && [[ ${#start} -ge 14 ]]; then
+    nc "$@" >/dev/null 2>&1
+    rc=$?
+    end="$(date +%s%N 2>/dev/null || true)"
+    if [[ "$end" =~ ^[0-9]+$ ]]; then
+      delta_ns=$((10#$end - 10#$start))
+      [[ "$delta_ns" -ge 0 ]] || delta_ns=0
+      awk -v ns="$delta_ns" 'BEGIN { printf "%.1f\n", ns / 1e6 }'
+    fi
+    return "$rc"
+  fi
+
+  nc "$@" >/dev/null 2>&1
+  return $?
+}
 
 sleep_ms() {
   local ms="$1"
@@ -118,8 +153,14 @@ echo "--- Starting TCP connect checks for ${HOST}:${PORT} (${COUNT} attempts, ti
 
 for ((i=1; i<=COUNT; i++)); do
   # -z: just scan/listen check (no data), -w: timeout.
-  if nc "${nc_args[@]}" "$HOST" "$PORT" >/dev/null 2>&1; then
-    echo "[$(date +%H:%M:%S)] Attempt $i: ${GREEN}SUCCESS${RESET}"
+  connect_ms="$(run_nc_timed "${nc_args[@]}" "$HOST" "$PORT")"
+  rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    if [[ -n "$connect_ms" ]]; then
+      echo "[$(date +%H:%M:%S)] Attempt $i: ${GREEN}SUCCESS${RESET} (${connect_ms} ms)"
+    else
+      echo "[$(date +%H:%M:%S)] Attempt $i: ${GREEN}SUCCESS${RESET}"
+    fi
     ((SUCCESS++))
   else
     echo "[$(date +%H:%M:%S)] Attempt $i: ${RED}FAILED${RESET}"
