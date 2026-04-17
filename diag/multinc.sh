@@ -32,6 +32,7 @@ NO_DNS=0
 
 SUCCESS=0
 FAILED=0
+MS_SAMPLES=()
 
 die() {
   echo "Error: $*" >&2
@@ -158,6 +159,7 @@ for ((i=1; i<=COUNT; i++)); do
   if [[ "$rc" -eq 0 ]]; then
     if [[ -n "$connect_ms" ]]; then
       echo "[$(date +%H:%M:%S)] Attempt $i: ${GREEN}SUCCESS${RESET} (${connect_ms} ms)"
+      MS_SAMPLES+=("$connect_ms")
     else
       echo "[$(date +%H:%M:%S)] Attempt $i: ${GREEN}SUCCESS${RESET}"
     fi
@@ -179,6 +181,25 @@ echo "Total attempts:  $COUNT"
 echo "Success:         $SUCCESS"
 echo "Failed:          $FAILED"
 echo "Success rate:    ${PERCENT_FLOAT}% ${DIM}(int ${PERCENT_INT}%)${RESET}"
+if [[ ${#MS_SAMPLES[@]} -gt 0 ]]; then
+  read -r MS_MIN MS_AVG MS_MAX <<<"$(
+    printf '%s\n' "${MS_SAMPLES[@]}" | awk '
+      {
+        v = $0 + 0
+        sum += v
+        if (NR == 1) { min = max = v }
+        else {
+          if (v < min) min = v
+          if (v > max) max = v
+        }
+      }
+      END { printf "%.1f %.1f %.1f\n", min, sum / NR, max }
+    '
+  )"
+  echo "Connect time ms: min ${MS_MIN} / avg ${MS_AVG} / max ${MS_MAX} ${DIM}(${#MS_SAMPLES[@]} samples)${RESET}"
+else
+  echo "Connect time ms: ${DIM}n/a (no samples; need bash 5+ EPOCHREALTIME or GNU date +%s%N)${RESET}"
+fi
 echo "---------------------------------------"
 
 [[ "$FAILED" -eq 0 ]] && exit 0 || exit 1
