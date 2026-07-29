@@ -13,8 +13,13 @@ set -u
 #   ./multidig.sh -s 1.1.1.1 -c 100 -n example.com -r A -t 1 -i 20
 #
 # Output:
-#   [10:00:00] Query 1: SUCCESS (Answer: 93.184.216.34)
+#   [10:00:00] Query 1: SUCCESS (12.3 ms, Answer: 93.184.216.34)
 #   [10:00:01] Query 2: FAILED (timeout / network error / no answer)
+#
+# Response time is measured as wall clock around the dig call, using:
+#   - Bash 5.1+ built-in EPOCHREALTIME when available
+#   - else GNU date +%s%N
+#   - else no timing (plain SUCCESS)
 
 DNS_SERVER=""
 COUNT=""
@@ -25,6 +30,7 @@ INTERVAL_MS=0
 
 SUCCESS=0
 FAILED=0
+MS_SAMPLES=()
 
 die() {
   echo "Error: $*" >&2
@@ -52,6 +58,39 @@ is_pos_int() { [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]; }
 is_nonneg_int() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# Runs dig with given args; sets RAW (dig output) and DIG_MS (response time in ms,
+# empty when no timing source is available). Returns dig's exit code.
+# Timing: bash EPOCHREALTIME (5.1+), else GNU date +%s%N; else none.
+run_dig_timed() {
+  local rc t0 t1 start end delta_ns
+  DIG_MS=""
+
+  if [[ "${BASH_VERSINFO[0]:-0}" -ge 5 ]] && [[ -n "${EPOCHREALTIME+x}" ]]; then
+    t0="$EPOCHREALTIME"
+    RAW="$(dig "$@" 2>&1)"
+    rc=$?
+    t1="$EPOCHREALTIME"
+    DIG_MS="$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f\n", (b - a) * 1000.0 }')"
+    return "$rc"
+  fi
+
+  start="$(date +%s%N 2>/dev/null || true)"
+  if [[ "$start" =~ ^[0-9]+$ ]] && [[ ${#start} -ge 14 ]]; then
+    RAW="$(dig "$@" 2>&1)"
+    rc=$?
+    end="$(date +%s%N 2>/dev/null || true)"
+    if [[ "$end" =~ ^[0-9]+$ ]]; then
+      delta_ns=$((10#$end - 10#$start))
+      [[ "$delta_ns" -ge 0 ]] || delta_ns=0
+      DIG_MS="$(awk -v ns="$delta_ns" 'BEGIN { printf "%.1f\n", ns / 1e6 }')"
+    fi
+    return "$rc"
+  fi
+
+  RAW="$(dig "$@" 2>&1)"
+  return $?
+}
 
 sleep_ms() {
   local ms="$1"
@@ -106,14 +145,19 @@ echo "--- Starting DNS checks for ${NAME} via ${DNS_SERVER} (${COUNT} queries, t
 
 for ((i=1; i<=COUNT; i++)); do
   # +short: compact output; +tries=1: no retries; +time: per-try timeout (seconds)
-  RAW="$(dig "@${DNS_SERVER}" "${NAME}" "${QTYPE}" +nocmd +noquestion +nocomments +nostats +short +time="${TIMEOUT_S}" +tries=1 2>&1)"
+  run_dig_timed "@${DNS_SERVER}" "${NAME}" "${QTYPE}" +nocmd +noquestion +nocomments +nostats +short +time="${TIMEOUT_S}" +tries=1
   EXIT_CODE=$?
   # dig may print diagnostics to stdout; treat only non-comment, non-empty lines as answers.
   ANSWER="$(printf "%s\n" "$RAW" | awk 'NF && $1 !~ /^;/' )"
 
   if [[ "$EXIT_CODE" -eq 0 && -n "$ANSWER" ]]; then
     CLEAN_ANSWER="$(printf "%s" "$ANSWER" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/[[:space:]]*$//')"
-    echo "[$(date +%H:%M:%S)] Query $i: ${GREEN}SUCCESS${RESET} (Answer: ${CLEAN_ANSWER})"
+    if [[ -n "$DIG_MS" ]]; then
+      echo "[$(date +%H:%M:%S)] Query $i: ${GREEN}SUCCESS${RESET} (${DIG_MS} ms, Answer: ${CLEAN_ANSWER})"
+      MS_SAMPLES+=("$DIG_MS")
+    else
+      echo "[$(date +%H:%M:%S)] Query $i: ${GREEN}SUCCESS${RESET} (Answer: ${CLEAN_ANSWER})"
+    fi
     ((SUCCESS++))
   else
     # Best-effort: show a short diagnostic snippet if present.
@@ -152,6 +196,25 @@ echo "Total queries:   $COUNT"
 echo "Success:         $SUCCESS"
 echo "Failed:          $FAILED"
 echo "Success rate:    ${PERCENT_FLOAT}% ${DIM}(int ${PERCENT_INT}%)${RESET}"
+if [[ ${#MS_SAMPLES[@]} -gt 0 ]]; then
+  read -r MS_MIN MS_AVG MS_MAX <<<"$(
+    printf '%s\n' "${MS_SAMPLES[@]}" | awk '
+      {
+        v = $0 + 0
+        sum += v
+        if (NR == 1) { min = max = v }
+        else {
+          if (v < min) min = v
+          if (v > max) max = v
+        }
+      }
+      END { printf "%.1f %.1f %.1f\n", min, sum / NR, max }
+    '
+  )"
+  echo "Response time ms: min ${MS_MIN} / avg ${MS_AVG} / max ${MS_MAX} ${DIM}(${#MS_SAMPLES[@]} samples)${RESET}"
+else
+  echo "Response time ms: ${DIM}n/a (no successful queries or no timing source: need bash 5+ EPOCHREALTIME or GNU date +%s%N)${RESET}"
+fi
 echo "---------------------------------------"
 
 [[ "$FAILED" -eq 0 ]] && exit 0 || exit 1
