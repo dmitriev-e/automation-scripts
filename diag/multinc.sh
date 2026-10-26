@@ -61,12 +61,15 @@ is_nonneg_int() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+# BusyBox nc has no -z/-n; there we connect with stdin=/dev/null, so nc exits right after connect.
+nc_supports_z() { nc -h 2>&1 | grep -qE '(^|[[:space:]])-z'; }
+
 # Runs nc with given args; prints connect time in ms (one line) to stdout; exit code = nc's exit code.
 # Timing: bash EPOCHREALTIME (5.1+), else GNU date +%s%N; else no stdout line (caller prints SUCCESS only).
 run_nc_timed() {
   if [[ "${BASH_VERSINFO[0]:-0}" -ge 5 ]] && [[ -n "${EPOCHREALTIME+x}" ]]; then
     local t0="$EPOCHREALTIME" t1 rc
-    nc "$@" >/dev/null 2>&1
+    nc "$@" </dev/null >/dev/null 2>&1
     rc=$?
     t1="$EPOCHREALTIME"
     awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f\n", (b - a) * 1000.0 }'
@@ -76,7 +79,7 @@ run_nc_timed() {
   local start end rc delta_ns
   start="$(date +%s%N 2>/dev/null || true)"
   if [[ "$start" =~ ^[0-9]+$ ]] && [[ ${#start} -ge 14 ]]; then
-    nc "$@" >/dev/null 2>&1
+    nc "$@" </dev/null >/dev/null 2>&1
     rc=$?
     end="$(date +%s%N 2>/dev/null || true)"
     if [[ "$end" =~ ^[0-9]+$ ]]; then
@@ -87,7 +90,7 @@ run_nc_timed() {
     return "$rc"
   fi
 
-  nc "$@" >/dev/null 2>&1
+  nc "$@" </dev/null >/dev/null 2>&1
   return $?
 }
 
@@ -147,13 +150,18 @@ else
   GREEN=""; RED=""; DIM=""; RESET=""
 fi
 
-nc_args=(-z -w "$TIMEOUT_S")
-[[ "$NO_DNS" -eq 1 ]] && nc_args+=(-n)
+nc_args=(-w "$TIMEOUT_S")
+if nc_supports_z; then
+  nc_args+=(-z)
+  [[ "$NO_DNS" -eq 1 ]] && nc_args+=(-n)
+else
+  [[ "$NO_DNS" -eq 1 ]] && echo "Warning: this nc has no -n; ignoring" >&2
+fi
 
 echo "--- Starting TCP connect checks for ${HOST}:${PORT} (${COUNT} attempts, timeout ${TIMEOUT_S}s) ---"
 
 for ((i=1; i<=COUNT; i++)); do
-  # -z: just scan/listen check (no data), -w: timeout.
+  # -z (if supported): just scan/listen check (no data), -w: timeout.
   connect_ms="$(run_nc_timed "${nc_args[@]}" "$HOST" "$PORT")"
   rc=$?
   if [[ "$rc" -eq 0 ]]; then
