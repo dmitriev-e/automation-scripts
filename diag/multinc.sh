@@ -82,13 +82,19 @@ has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 # BusyBox nc has no -z/-n; there we connect with stdin=/dev/null, so nc exits right after connect.
 nc_supports_z() { nc -h 2>&1 | grep -qE '(^|[[:space:]])-z'; }
+# OpenBSD nc prints the connect error only with -v
+nc_supports_v() { nc -h 2>&1 | grep -qE '(^|[[:space:]])-v'; }
 
-# Runs nc with given args; prints connect time in ms (one line) to stdout; exit code = nc's exit code.
+# nc stderr of the last attempt (failure reason: refused / no route / bind error / timeout)
+NC_ERR="$(mktemp 2>/dev/null || echo "/tmp/multinc.err.$$")"
+trap 'rm -f "$NC_ERR"' EXIT
+
+# Runs nc with given args; prints elapsed time in ms (one line) to stdout; exit code = nc's exit code.
 # Timing: bash EPOCHREALTIME (5.1+), else GNU date +%s%N; else no stdout line (caller prints SUCCESS only).
 run_nc_timed() {
   if [[ "${BASH_VERSINFO[0]:-0}" -ge 5 ]] && [[ -n "${EPOCHREALTIME+x}" ]]; then
     local t0="$EPOCHREALTIME" t1 rc
-    nc "$@" </dev/null >/dev/null 2>&1
+    nc "$@" </dev/null >/dev/null 2>"$NC_ERR"
     rc=$?
     t1="$EPOCHREALTIME"
     awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f\n", (b - a) * 1000.0 }'
@@ -98,7 +104,7 @@ run_nc_timed() {
   local start end rc delta_ns
   start="$(date +%s%N 2>/dev/null || true)"
   if [[ "$start" =~ ^[0-9]+$ ]] && [[ ${#start} -ge 14 ]]; then
-    nc "$@" </dev/null >/dev/null 2>&1
+    nc "$@" </dev/null >/dev/null 2>"$NC_ERR"
     rc=$?
     end="$(date +%s%N 2>/dev/null || true)"
     if [[ "$end" =~ ^[0-9]+$ ]]; then
@@ -109,8 +115,14 @@ run_nc_timed() {
     return "$rc"
   fi
 
-  nc "$@" </dev/null >/dev/null 2>&1
+  nc "$@" </dev/null >/dev/null 2>"$NC_ERR"
   return $?
+}
+
+# Short failure reason from the last nc stderr line, e.g. "Connection refused".
+nc_fail_reason() {
+  [[ -s "$NC_ERR" ]] || return 0
+  tail -n 1 "$NC_ERR" | sed -e 's/.*: //' -e 's/[[:space:]]*$//'
 }
 
 # Current time in seconds with fraction (bash 5 EPOCHREALTIME or GNU date); empty if unavailable.
@@ -225,7 +237,7 @@ if [[ "$CAPTURE" -eq 1 ]]; then
   CAP_FILTER="(host ${DST_IP} and ${PROTO} port ${PORT}) or icmp or icmp6"
   mn_sudo_init || exit 2
   NSTAT_A="$(mktemp)"; NSTAT_B="$(mktemp)"
-  trap 'mn_capture_stop >/dev/null; rm -f "$NSTAT_A" "$NSTAT_B"' EXIT
+  trap 'mn_capture_stop >/dev/null; rm -f "$NSTAT_A" "$NSTAT_B" "$NC_ERR"' EXIT
   trap 'exit 130' INT TERM
   mn_nstat_snap "$NSTAT_A"
   mn_capture_start "$IFACE" "$CAP_FILTER" "$PCAP" || exit 2
@@ -254,6 +266,9 @@ if nc_supports_z; then
 else
   [[ "$NO_DNS" -eq 1 ]] && echo "Warning: this nc has no -n; ignoring" >&2
 fi
+# -v: make nc report why a connect failed (shown next to FAILED)
+nc_supports_v && nc_args+=(-v)
+FAIL_REASONS=""
 
 if [[ "$UDP" -eq 1 ]]; then
   echo "--- Starting UDP echo checks for ${HOST}:${PORT} (${COUNT} attempts, timeout ${TIMEOUT_S}s) ---"
@@ -286,7 +301,24 @@ for ((i=1; i<=COUNT; i++)); do
     fi
     ((SUCCESS++))
   else
-    echo "[$(date +%H:%M:%S)] Attempt $i: ${RED}FAILED${RESET}${src_tag}"
+    # Elapsed time tells fast reject (RST / ICMP, ~RTT) from silence (~timeout)
+    reason=""
+    if [[ "$UDP" -eq 0 ]]; then
+      reason="$(nc_fail_reason)"
+      reason="${reason%.}"
+      # nc variants word timeouts differently ("Operation now in progress", "TIMEOUT", ...)
+      if [[ -n "$connect_ms" ]] &&
+         awk -v ms="$connect_ms" -v t="$TIMEOUT_S" 'BEGIN { exit !(ms >= t * 900) }'; then
+        reason="timeout (no answer)"
+      fi
+    else
+      reason="no echo (timeout)"
+    fi
+    fail_info=""
+    [[ -n "$connect_ms" ]] && fail_info="${connect_ms} ms"
+    [[ -n "$reason" ]] && fail_info="${fail_info:+${fail_info}, }${reason}"
+    echo "[$(date +%H:%M:%S)] Attempt $i: ${RED}FAILED${RESET}${fail_info:+ (${fail_info})}${src_tag}"
+    FAIL_REASONS="${FAIL_REASONS}${reason:-unknown}"$'\n'
     ((FAILED++))
   fi
 
@@ -319,8 +351,14 @@ if [[ ${#MS_SAMPLES[@]} -gt 0 ]]; then
     '
   )"
   echo "${TIME_LABEL}: min ${MS_MIN} / avg ${MS_AVG} / max ${MS_MAX} ${DIM}(${#MS_SAMPLES[@]} samples)${RESET}"
+elif [[ "$SUCCESS" -eq 0 ]]; then
+  echo "${TIME_LABEL}: ${DIM}n/a (no successful attempts)${RESET}"
 else
   echo "${TIME_LABEL}: ${DIM}n/a (no samples; need bash 5+ EPOCHREALTIME or GNU date +%s%N)${RESET}"
+fi
+if [[ -n "$FAIL_REASONS" ]]; then
+  echo "Failure reasons:"
+  printf '%s' "$FAIL_REASONS" | sort | uniq -c | sort -rn | sed 's/^/  /'
 fi
 echo "---------------------------------------"
 
