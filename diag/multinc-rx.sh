@@ -9,18 +9,12 @@ set -u
 #   SYN-ACK TX(dst) != SYN-ACK RX(src)  -> return path loss
 #
 # Usage:
-#   ./multinc-rx.sh -p <port> [-u] [-I <iface>] [-d <seconds>] [-N] [-6] [-f <client_ip>] [-F] [-T]
+#   ./multinc-rx.sh -p <port> [-u] [-I <iface>] [-d <seconds>] [-N] [-6] [-f <client_ip>]
 #
 # Examples:
 #   ./multinc-rx.sh -p 5001                 # TCP listener + capture until Ctrl+C
 #   ./multinc-rx.sh -p 5001 -u -d 120       # UDP echo for 120s
 #   ./multinc-rx.sh -p 443 -N -I bond0      # real service already on 443: capture only
-#   ./multinc-rx.sh -p 10000 -F             # firewall check only (nft/iptables/ufw/firewalld)
-#   ./multinc-rx.sh -p 10000 -T -f 10.0.0.1 # + nft trace: which rule drops each SYN
-#
-# Firewall: a static check (heuristic verdict) is printed at start, counter deltas of
-# drop/reject/policy/port rules at the end. -T adds nft trace (own table inet multinc_trace,
-# removed on exit) — definitive for nft/iptables-nft, blind to legacy iptables.
 #
 # Needs: tcpdump, socat (unless -N), sudo (unless root), multinc-lib.sh next to this script.
 #
@@ -35,8 +29,6 @@ DURATION=0
 NO_LISTEN=0
 IPV6=0
 CLIENT=""
-FW_ONLY=0
-FW_TRACE=0
 
 die() {
   echo "Error: $*" >&2
@@ -46,7 +38,7 @@ die() {
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  multinc-rx.sh -p <port> [-u] [-I <iface>] [-d <seconds>] [-N] [-6] [-f <client_ip>] [-F] [-T]
+  multinc-rx.sh -p <port> [-u] [-I <iface>] [-d <seconds>] [-N] [-6] [-f <client_ip>]
 
 Options:
   -p port      Port to listen on / capture (1-65535)
@@ -56,13 +48,11 @@ Options:
   -N           Do not start a listener (a real service already owns the port): capture only
   -6           Listen dual-stack (IPv6 + IPv4) instead of IPv4 only
   -f client_ip Capture only traffic from/to this client
-  -F           Firewall check only (static nft/iptables/ufw/firewalld analysis), then exit
-  -T           nft trace of incoming SYNs / datagrams: shows the exact rule that drops them
 EOF
   exit 2
 }
 
-while getopts ":p:uI:d:N6f:FT" opt; do
+while getopts ":p:uI:d:N6f:" opt; do
   case "$opt" in
     p) PORT="$OPTARG" ;;
     u) UDP=1 ;;
@@ -71,8 +61,6 @@ while getopts ":p:uI:d:N6f:FT" opt; do
     N) NO_LISTEN=1 ;;
     6) IPV6=1 ;;
     f) CLIENT="$OPTARG" ;;
-    F) FW_ONLY=1 ;;
-    T) FW_TRACE=1 ;;
     *) usage ;;
   esac
 done
@@ -87,18 +75,10 @@ LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/multinc-lib.sh"
 # shellcheck source=multinc-lib.sh
 . "$LIB"
 
-PROTO="tcp"; [[ "$UDP" -eq 1 ]] && PROTO="udp"
-
-# -F: firewall check only, no capture/listener deps needed
-if [[ "$FW_ONLY" -eq 1 ]]; then
-  mn_sudo_init || exit 2
-  mn_fw_static "$PROTO" "$PORT"
-  exit 0
-fi
-
 mn_has_cmd tcpdump || die "'tcpdump' not found (apt install tcpdump)"
 [[ "$NO_LISTEN" -eq 1 ]] || mn_has_cmd socat || die "'socat' not found (apt install socat)"
 
+PROTO="tcp"; [[ "$UDP" -eq 1 ]] && PROTO="udp"
 PCAP="./multinc-rx-${PORT}-${PROTO}-$(date +%Y%m%d-%H%M%S).pcap"
 CAP_FILTER="${PROTO} port ${PORT}"
 [[ -n "$CLIENT" ]] && CAP_FILTER="host ${CLIENT} and ${CAP_FILTER}"
@@ -112,8 +92,6 @@ LST_PIDF="$(mktemp)"
 LST_ERR="$(mktemp)"
 NSTAT_A="$(mktemp)"
 NSTAT_B="$(mktemp)"
-FW_A="$(mktemp)"
-FW_B="$(mktemp)"
 
 stop_listener() {
   [[ -n "$LST_BG" ]] || return 0
@@ -124,21 +102,13 @@ stop_listener() {
 
 cleanup() {
   stop_listener
-  mn_fw_trace_stop   # always drops the temporary nft trace table
   mn_capture_stop >/dev/null
-  rm -f "$LST_PIDF" "$LST_ERR" "$NSTAT_A" "$NSTAT_B" "$FW_A" "$FW_B"
+  rm -f "$LST_PIDF" "$LST_ERR" "$NSTAT_A" "$NSTAT_B"
 }
 trap cleanup EXIT
 
-mn_fw_static "$PROTO" "$PORT"
-echo
-
 mn_nstat_snap "$NSTAT_A"
-mn_fw_snap "$FW_A"
 mn_capture_start "$IFACE" "$CAP_FILTER" "$PCAP" || exit 2
-if [[ "$FW_TRACE" -eq 1 ]]; then
-  mn_fw_trace_start "$PROTO" "$PORT" "$CLIENT" || FW_TRACE=0
-fi
 
 if [[ "$NO_LISTEN" -eq 0 ]]; then
   fam=""; famopt=""
@@ -196,15 +166,12 @@ stop_listener
 # let in-flight FIN/RST/echo packets land in the capture
 sleep 0.5
 mn_nstat_snap "$NSTAT_B"
-mn_fw_snap "$FW_B"
 
 echo "---------------------------------------"
 echo "Packet phases on this side (responder ${PROTO}/${PORT}, iface ${IFACE}, $((SECONDS - START_S))s):"
 mn_capture_stop
 mn_phases_report "$PCAP" "$PROTO" server "$PORT"
 mn_nstat_delta "$NSTAT_A" "$NSTAT_B"
-mn_fw_delta "$FW_A" "$FW_B" "$PORT"
-[[ "$FW_TRACE" -eq 1 ]] && mn_fw_trace_stop report
 echo "pcap: ${PCAP}"
 echo "---------------------------------------"
 exit 0
