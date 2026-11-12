@@ -89,12 +89,12 @@ mn_capture_stop() {
   wait "$MN_CAP_BG" 2>/dev/null || true
   MN_CAP_BG=""
   # e.g. "0 packets dropped by kernel" — non-zero means capture itself lost packets, stats are unreliable
-  grep -E "captured|dropped" "$MN_CAP_ERR" 2>/dev/null | sed 's/^/  tcpdump: /'
+  grep -E "packets (captured|dropped)" "$MN_CAP_ERR" 2>/dev/null | sed 's/^/  tcpdump: /'
   rm -f "$MN_CAP_ERR" "$MN_CAP_PIDF"
 }
 
 # System-wide kernel counters relevant to handshake / UDP loss.
-MN_NSTAT_KEYS="TcpExtTCPSynRetrans TcpAttemptFails TcpOutRsts TcpRetransSegs TcpExtListenOverflows TcpExtListenDrops TcpExtTCPReqQFullDrop TcpExtSyncookiesSent TcpExtTCPTimeouts UdpInErrors UdpRcvbufErrors UdpSndbufErrors UdpNoPorts"
+MN_NSTAT_KEYS="TcpExtTCPSynRetrans TcpAttemptFails TcpOutRsts TcpRetransSegs TcpExtListenOverflows TcpExtListenDrops TcpExtTCPReqQFullDrop TcpExtSyncookiesSent TcpExtTCPTimeouts TcpExtIPReversePathFilter UdpInErrors UdpRcvbufErrors UdpSndbufErrors UdpNoPorts"
 
 # mn_nstat_snap <file>: absolute counters, does not touch nstat history (-s).
 mn_nstat_snap() {
@@ -157,8 +157,12 @@ BEGIN {
 
   # ICMP unreachables related to our port / peer (firewall rejects, closed UDP port, ...)
   if (index($0, "ICMP") && index($0, "unreachable")) {
-    if (index($0, "port " port " ") || (peer != "" && index($0, " " peer " ")) || index($0, "unreachable port"))
+    if (index($0, "port " port " ") || (peer != "" && index($0, " " peer " ")) || index($0, "unreachable port")) {
       icmp_unreach++
+      # breakdown by sender + message: tells which hop rejects (firewall / ACL / router)
+      m = $0; sub(/.*ICMP6?,? /, "", m); sub(/, length.*/, "", m)
+      icmp_by[strip_colon($(ip + 1)) " -> " strip_colon($(ip + 3)) ": " m]++
+    }
     next
   }
 
@@ -223,7 +227,21 @@ END {
     row("RST", T_rstc, T_rsts)
     if (T_datac + T_datas > 0) row("DATA segments", T_datac, T_datas)
   }
-  if (icmp_unreach > 0) printf "  %-20s %8d (any direction)\n", "ICMP unreachable", icmp_unreach
+  if (icmp_unreach > 0) {
+    printf "  %-20s %8d (any direction)\n", "ICMP unreachable", icmp_unreach
+    for (k in icmp_by) printf "    %6d  %s\n", icmp_by[k], k
+  }
+
+  # Hints for the classic "SYN arrives, nothing answers" pattern
+  if (proto == "tcp" && T_syn > 0 && T_synack == 0) {
+    if (side == "server") {
+      print "  !! SYN received but NO SYN-ACK sent: dropped on this host after capture point."
+      print "     Check: rp_filter (nstat TcpExtIPReversePathFilter, ip route get <client>),"
+      print "     iptables/nft DROP, listener netns/VRF (ss -ltnp; net.ipv4.tcp_l3mdev_accept)."
+    } else if (icmp_unreach > 0) {
+      print "  !! No SYN-ACK at all, ICMP unreachables received: see senders above (path ACL/firewall?)."
+    }
+  }
 
   ok = 0; bad = 0
   for (f = 1; f <= nf; f++) {
@@ -262,4 +280,288 @@ mn_phases_report() {
   [[ -s "$pcap" ]] || { echo "  (pcap empty or missing: $pcap)"; return 0; }
   tcpdump -nn -tt -S -r "$pcap" 2>/dev/null |
     awk -v port="$port" -v proto="$proto" -v side="$side" -v peer="$peer" "$MN_PHASES_AWK"
+}
+
+# --- firewall checks (nft / iptables / ufw / firewalld) ------------------------------------
+
+# port_in(spec, p): spec like "10000", "22,10000", "9000:11000", "{ 22, 9000-11000 }"
+MN_AWK_PORTFN='
+function port_in(spec, p,   n, a, i, r) {
+  gsub(/[{} ]/, "", spec)
+  n = split(spec, a, ",")
+  for (i = 1; i <= n; i++) {
+    if (a[i] ~ /^[0-9]+[-:][0-9]+$/) { split(a[i], r, /[-:]/); if (p >= r[1] + 0 && p <= r[2] + 0) return 1 }
+    else if (a[i] ~ /^[0-9]+$/ && a[i] + 0 == p) return 1
+  }
+  return 0
+}
+function verdict_line(port_acc, port_drp, port_jmp, pol_drop, catch_n, unsure) {
+  if (port_drp) return "BLOCKED: explicit drop/reject for this port (check rule order vs accepts)"
+  if (port_acc && !port_jmp) return "OPEN (probably): explicit accept for this port; order/iif/saddr not evaluated"
+  if (port_acc || port_jmp) return "UNSURE: port is handled via jump/goto chains, see rules above"
+  if (pol_drop || catch_n) return "BLOCKED (likely): no rule for this port and default/catch-all drop"
+  if (unsure) return "UNSURE: named sets / xt matches not evaluated, see notes"
+  return "OPEN (likely): no rule for this port and no default drop found"
+}'
+
+# Static nft ruleset analysis (input: `nft list ruleset`). Vars: proto, port.
+MN_FW_NFT_AWK="$MN_AWK_PORTFN"'
+function verdict_of(l) {
+  if (l ~ /(^| )drop$/) return "drop"
+  if (l ~ /(^| )reject( |$)/) return "reject"
+  if (l ~ /(^| )accept$/) return "accept"
+  if (match(l, /(jump|goto) [^ ]+/)) return substr(l, RSTART, RLENGTH)
+  return ""
+}
+{ line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+inset { if (line == "}") inset = 0; next }
+line ~ /^table / { tbl = $2 " " $3; next }
+line ~ /^(set|map|flowtable) / { inset = 1; next }
+line ~ /^chain / { chain = $2; next }
+line == "}" { if (chain != "") chain = ""; else tbl = ""; next }
+chain == "" { next }
+line ~ /^type .* hook / {
+  for (i = 1; i <= NF; i++) if ($i == "hook") hook = $(i + 1)
+  sub(/;$/, "", hook)
+  pol = "accept"
+  if (match(line, /policy [a-z]+/)) pol = substr(line, RSTART + 7, RLENGTH - 7)
+  if (hook == "input") { pols = pols "\n    " tbl " " chain ": hook input policy " pol; if (pol == "drop") pol_drop = 1 }
+  next
+}
+{
+  v = verdict_of(line); loc = tbl " " chain
+  if (index(line, "xt match") || index(line, "xt target")) { unsure = 1; notes = notes "\n    [xt] " loc ": " line }
+  if (index(line, "dport")) {
+    if (!(index(line, proto " dport") || index(line, "th dport"))) next
+    s = line; sub(/.*dport /, "", s)
+    if (substr(s, 1, 3) == "!= ") { unsure = 1; notes = notes "\n    [neg] " loc ": " line; next }
+    if (substr(s, 1, 1) == "{") sub(/\}.*/, "}", s); else sub(/ .*/, "", s)
+    if (substr(s, 1, 1) == "@") { unsure = 1; notes = notes "\n    [set] " loc ": " line; next }
+    if (port_in(s, port)) {
+      hits = hits "\n    " loc ": " line
+      if (v == "accept") acc = 1; else if (v == "drop" || v == "reject") drp = 1; else jmp = 1
+    }
+    next
+  }
+  if ((v == "drop" || v == "reject") && line !~ /(ct state|ct status|saddr|daddr|iif|oif|sport|icmp|fib |limit )/) {
+    catch_n++; catches = catches "\n    " loc ": " line
+  }
+}
+END {
+  print "  input hooks:" (pols == "" ? " (none)" : pols)
+  print "  rules for " proto "/" port ":" (hits == "" ? " (none)" : hits)
+  print "  catch-all drop/reject:" (catches == "" ? " (none)" : catches)
+  if (notes != "") print "  not evaluated (check manually):" notes
+  print "  => " verdict_line(acc, drp, jmp, pol_drop, catch_n, unsure)
+}'
+
+# Static iptables-save analysis. Vars: proto, port.
+MN_FW_IPT_AWK="$MN_AWK_PORTFN"'
+/^\*/ { tbl = substr($0, 2); next }
+/^:/ {
+  ch = substr($1, 2)
+  if (tbl == "filter" && ch == "INPUT") { pols = pols "\n    filter INPUT policy " $2; if ($2 == "DROP") pol_drop = 1 }
+  next
+}
+/-A / {
+  line = $0; sub(/^\[[0-9]+:[0-9]+\] /, "", line)
+  n = split(line, t, " "); p = ""; ds = ""; tgt = ""; neg = 0
+  for (i = 1; i <= n; i++) {
+    if (t[i] == "-p") p = t[i + 1]
+    else if (t[i] ~ /^--(dport|dports|destination-port|destination-ports)$/) { ds = t[i + 1]; if (i > 1 && t[i - 1] == "!") neg = 1 }
+    else if (t[i] == "-j" || t[i] == "-g") tgt = t[i + 1]
+  }
+  loc = tbl
+  if (ds != "") {
+    if (p != "" && p != proto) next
+    if (neg) { unsure = 1; notes = notes "\n    [neg] " loc ": " line; next }
+    if (port_in(ds, port)) {
+      hits = hits "\n    " loc ": " line
+      if (tgt == "ACCEPT") acc = 1; else if (tgt == "DROP" || tgt == "REJECT") drp = 1; else jmp = 1
+    }
+    next
+  }
+  if (index(line, "-m set")) { unsure = 1; notes = notes "\n    [ipset] " loc ": " line }
+  if ((tgt == "DROP" || tgt == "REJECT") && (p == "" || p == proto) &&
+      line !~ /(-s |-d |-i |-o |--ctstate|--state|--sport|icmp|--limit|-m set)/) {
+    catch_n++; catches = catches "\n    " loc ": " line
+  }
+}
+END {
+  print "  policies:" (pols == "" ? " (none)" : pols)
+  print "  rules for " proto "/" port ":" (hits == "" ? " (none)" : hits)
+  print "  catch-all DROP/REJECT:" (catches == "" ? " (none)" : catches)
+  if (notes != "") print "  not evaluated (check manually):" notes
+  print "  => " verdict_line(acc, drp, jmp, pol_drop, catch_n, unsure)
+}'
+
+# iptables backend: "nf_tables" | "legacy" | "" (not installed)
+mn_ipt_backend() {
+  mn_has_cmd iptables || return 0
+  case "$(iptables -V 2>/dev/null)" in
+    *nf_tables*) echo "nf_tables" ;;
+    *) echo "legacy" ;;
+  esac
+}
+
+# mn_fw_static <tcp|udp> <port>: read-only firewall check with a heuristic verdict.
+# Heuristic: rule order, iif/saddr matches and jumps are not fully evaluated -> use -T trace for proof.
+mn_fw_static() {
+  local proto="$1" port="$2" ipt legacy_rules=0
+  ipt="$(mn_ipt_backend)"
+  echo "Firewall check for ${proto}/${port} (static, heuristic):"
+  if mn_has_cmd nft; then
+    echo " [nft ruleset]$([[ "$ipt" == "nf_tables" ]] && echo " (includes iptables-nft rules)")"
+    $MN_SUDO nft list ruleset 2>/dev/null | awk -v proto="$proto" -v port="$port" "$MN_FW_NFT_AWK"
+  fi
+  # legacy iptables is invisible to nft (and to nft trace)
+  if [[ "$ipt" == "legacy" ]] || { [[ "$ipt" == "nf_tables" ]] && mn_has_cmd iptables-legacy-save; }; then
+    local save="iptables-save"
+    [[ "$ipt" == "nf_tables" ]] && save="iptables-legacy-save"
+    if $MN_SUDO "$save" 2>/dev/null | grep -q '^-A '; then
+      legacy_rules=1
+      echo " [iptables legacy] ($save)"
+      $MN_SUDO "$save" 2>/dev/null | awk -v proto="$proto" -v port="$port" "$MN_FW_IPT_AWK"
+    fi
+  fi
+  if ! mn_has_cmd nft && [[ "$ipt" == "nf_tables" ]]; then
+    echo " [iptables-nft] (nft binary missing, using iptables-save)"
+    $MN_SUDO iptables-save 2>/dev/null | awk -v proto="$proto" -v port="$port" "$MN_FW_IPT_AWK"
+  fi
+  [[ -z "$ipt" ]] && ! mn_has_cmd nft && echo "  neither nft nor iptables found"
+  if mn_has_cmd ufw; then
+    local ufw_st
+    ufw_st="$($MN_SUDO ufw status 2>/dev/null)"
+    echo " [ufw] $(head -1 <<<"$ufw_st")"
+    grep -E "(^|[^0-9])${port}([^0-9]|$)" <<<"$ufw_st" | sed 's/^/    /'
+  fi
+  if mn_has_cmd firewall-cmd && $MN_SUDO firewall-cmd --state >/dev/null 2>&1; then
+    echo " [firewalld] running"
+    $MN_SUDO firewall-cmd --list-all 2>/dev/null | grep -E '^\s*(services|ports|rich rules):' | sed 's/^\s*/    /'
+  fi
+  [[ "$legacy_rules" -eq 1 && "$ipt" == "nf_tables" ]] &&
+    echo "  !! legacy iptables rules exist alongside nft: both are applied, nft trace does not see legacy"
+  return 0
+}
+
+# Firewall counters snapshot (rules with counters + iptables chain policies).
+mn_fw_snap() {
+  local ipt
+  ipt="$(mn_ipt_backend)"
+  {
+    if mn_has_cmd nft; then echo "##nft"; $MN_SUDO nft list ruleset 2>/dev/null; fi
+    if [[ -n "$ipt" ]]; then echo "##iptables"; $MN_SUDO iptables-save -c 2>/dev/null; fi
+    if [[ "$ipt" == "nf_tables" ]] && mn_has_cmd iptables-legacy-save; then
+      echo "##iptables-legacy"; $MN_SUDO iptables-legacy-save -c 2>/dev/null
+    fi
+  } >"$1"
+}
+
+# mn_fw_delta <before> <after> <port>: counters that grew on drop/reject/policy or port rules.
+# Counters are global: other traffic hitting the same rules is included.
+mn_fw_delta() {
+  [[ -s "$1" && -s "$2" ]] || return 0
+  echo "Firewall counters delta (drop/reject/policy/port rules; global, other traffic included):"
+  awk -v port="$3" '
+    FNR == 1 { f++; sec = ""; tbl = ""; chain = "" }
+    /^##/ { sec = substr($0, 3); next }
+    {
+      line = $0; sub(/^[ \t]+/, "", line); k = ""; v = ""
+      if (sec == "nft") {
+        if (line ~ /^table /) { tbl = $2 " " $3; next }
+        if (line ~ /^chain /) { chain = $2; next }
+        if (!match(line, /counter packets [0-9]+ bytes [0-9]+/)) next
+        c = substr(line, RSTART, RLENGTH); split(c, cc, " "); v = cc[3]
+        k = tbl " " chain ": " substr(line, 1, RSTART - 1) "counter" substr(line, RSTART + RLENGTH)
+      } else {
+        if (line ~ /^\*/) { tbl = substr(line, 2); next }
+        if (line ~ /^:/ && match(line, /\[[0-9]+:[0-9]+\]$/)) {
+          c = substr(line, RSTART + 1, RLENGTH - 2); split(c, cc, ":"); v = cc[1]
+          k = tbl " " substr(line, 1, RSTART - 2) " (policy)"
+        } else if (match(line, /^\[[0-9]+:[0-9]+\] /)) {
+          c = substr(line, 2, RLENGTH - 3); split(c, cc, ":"); v = cc[1]
+          k = tbl " " substr(line, RLENGTH + 1)
+        } else next
+      }
+      key = sec "|" k; key = key "#" (++occ[f, key])
+      if (f == 1) { a[key] = v; next }
+      d = v - a[key]
+      if (d <= 0) next
+      if (k ~ /(drop|reject|DROP|REJECT)/ || k ~ /\(policy\)$/ || k ~ ("dports? " port "([^0-9]|$)") || k ~ ("dport " port "([^0-9]|$)")) {
+        out[++n] = sprintf("  %+8d  [%s] %s", d, sec, k)
+      }
+    }
+    END {
+      if (!n) print "  (no matching counters grew)"
+      for (i = 1; i <= n && i <= 40; i++) print out[i]
+      if (n > 40) printf "  ... %d more\n", n - 40
+    }
+  ' "$1" "$2"
+}
+
+# --- nft trace: exact verdict path per packet (opt-in, creates own table, removed on stop) ---
+MN_TRACE_TABLE="multinc_trace"
+MN_TRACE_BG=""
+MN_TRACE_PIDF=""
+MN_TRACE_OUT=""
+
+# mn_fw_trace_start <tcp|udp> <port> [client_ip]: traces only new SYNs (tcp) / datagrams (udp).
+mn_fw_trace_start() {
+  local proto="$1" port="$2" client="${3:-}" match
+  mn_has_cmd nft || { echo "Warning: nft not found, trace disabled" >&2; return 1; }
+  match="${proto} dport ${port}"
+  [[ "$proto" == "tcp" ]] && match="${match} tcp flags & (syn | ack) == syn"
+  if [[ -n "$client" ]]; then
+    if [[ "$client" == *:* ]]; then match="ip6 saddr ${client} ${match}"; else match="ip saddr ${client} ${match}"; fi
+  fi
+  # set before creating the table so mn_fw_trace_stop always cleans it up (even on early exit)
+  MN_TRACE_PIDF="$(mktemp)"
+  MN_TRACE_OUT="$(mktemp)"
+  # priority -350: before raw (-300) and conntrack (-200), so every later hook is traced
+  $MN_SUDO nft add table inet "$MN_TRACE_TABLE" &&
+    $MN_SUDO nft add chain inet "$MN_TRACE_TABLE" pre '{ type filter hook prerouting priority -350; policy accept; }' &&
+    $MN_SUDO nft add rule inet "$MN_TRACE_TABLE" pre $match meta nftrace set 1 || {
+      echo "Warning: failed to set up nft trace" >&2
+      mn_fw_trace_stop
+      return 1
+    }
+  # stdbuf: nft monitor output to a file is block-buffered, lines would be lost on kill
+  mn_root_bg "$MN_TRACE_PIDF" "$MN_TRACE_OUT" sh -c 'exec stdbuf -oL nft monitor trace 1>&2'
+  MN_TRACE_BG="$MN_BG_PID"
+  sleep 0.3
+}
+
+# Stops trace, ALWAYS removes the trace table; prints summary if $1 == "report".
+mn_fw_trace_stop() {
+  if [[ -n "$MN_TRACE_BG" ]]; then
+    # TERM, not INT: background jobs inherit SIGINT=ignore and nft has no own handler
+    mn_root_kill TERM "$MN_TRACE_PIDF"
+    wait "$MN_TRACE_BG" 2>/dev/null || true
+    MN_TRACE_BG=""
+  fi
+  if [[ -n "$MN_TRACE_OUT" ]]; then
+    $MN_SUDO nft delete table inet "$MN_TRACE_TABLE" 2>/dev/null || true
+    if [[ "${1:-}" == "report" ]]; then
+      echo "Firewall trace (nft monitor trace; first drop/reject per packet):"
+      awk '
+        $1 == "trace" && $2 == "id" {
+          id = $3; if (!(id in seen)) { seen[id] = 1; n++ }
+          if (id in dropped) next
+          if ($0 ~ /\(verdict (drop|reject)/ || $0 ~ / policy drop/) {
+            dropped[id] = 1; nd++
+            loc = ""; for (i = 4; i <= NF; i++) loc = loc " " $i
+            sub(/ \(verdict [a-z]+\)/, "", loc); gsub(/counter packets [0-9]+ bytes [0-9]+ /, "", loc)
+            by[loc]++
+          }
+        }
+        END {
+          printf "  packets traced: %d, dropped/rejected by netfilter: %d\n", n, nd
+          for (k in by) printf "  %8d %s\n", by[k], k
+          if (n == 0) print "  (nothing traced: packets did not reach netfilter on this host, or legacy iptables)"
+        }
+      ' "$MN_TRACE_OUT"
+    fi
+    rm -f "$MN_TRACE_OUT" "$MN_TRACE_PIDF"
+    MN_TRACE_OUT=""
+  fi
 }
