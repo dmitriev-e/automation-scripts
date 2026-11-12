@@ -85,6 +85,19 @@ nc_supports_z() { nc -h 2>&1 | grep -qE '(^|[[:space:]])-z'; }
 # OpenBSD nc prints the connect error only with -v
 nc_supports_v() { nc -h 2>&1 | grep -qE '(^|[[:space:]])-v'; }
 
+NC_USAGE_RE='usage|invalid option|unrecognized option|illegal option|unknown option'
+
+# True if nc rejects these options (prints usage) on a dummy connect to a closed local port.
+# Needed because e.g. minimal BusyBox nc lists -p in help but only accepts it with -l.
+nc_rejects() {
+  local out
+  out="$(nc "$@" 127.0.0.1 9 </dev/null 2>&1 >/dev/null)"
+  grep -qiE "$NC_USAGE_RE" <<<"$out"
+}
+
+# Connector binary used by run_nc_timed: nc, or socat when nc can't bind a source port
+TCP_BIN="nc"
+
 # nc stderr of the last attempt (failure reason: refused / no route / bind error / timeout)
 NC_ERR="$(mktemp 2>/dev/null || echo "/tmp/multinc.err.$$")"
 trap 'rm -f "$NC_ERR"' EXIT
@@ -94,7 +107,7 @@ trap 'rm -f "$NC_ERR"' EXIT
 run_nc_timed() {
   if [[ "${BASH_VERSINFO[0]:-0}" -ge 5 ]] && [[ -n "${EPOCHREALTIME+x}" ]]; then
     local t0="$EPOCHREALTIME" t1 rc
-    nc "$@" </dev/null >/dev/null 2>"$NC_ERR"
+    "$TCP_BIN" "$@" </dev/null >/dev/null 2>"$NC_ERR"
     rc=$?
     t1="$EPOCHREALTIME"
     awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f\n", (b - a) * 1000.0 }'
@@ -104,7 +117,7 @@ run_nc_timed() {
   local start end rc delta_ns
   start="$(date +%s%N 2>/dev/null || true)"
   if [[ "$start" =~ ^[0-9]+$ ]] && [[ ${#start} -ge 14 ]]; then
-    nc "$@" </dev/null >/dev/null 2>"$NC_ERR"
+    "$TCP_BIN" "$@" </dev/null >/dev/null 2>"$NC_ERR"
     rc=$?
     end="$(date +%s%N 2>/dev/null || true)"
     if [[ "$end" =~ ^[0-9]+$ ]]; then
@@ -115,13 +128,61 @@ run_nc_timed() {
     return "$rc"
   fi
 
-  nc "$@" </dev/null >/dev/null 2>"$NC_ERR"
+  "$TCP_BIN" "$@" </dev/null >/dev/null 2>"$NC_ERR"
   return $?
 }
 
-# Short failure reason from the last nc stderr line, e.g. "Connection refused".
+# Fixed-source-port connect via python3/perl (fallback when nc can't -p and socat is absent).
+# probe_script <src_port>: prints elapsed connect ms (measured in-process, so interpreter
+# startup is excluded); rc 0 = connected; error goes to stderr as "...: <reason>".
+probe_script() {
+  local sport="$1"
+  if [[ "$TCP_BIN" == "python3" ]]; then
+    python3 -c '
+import socket, sys, time
+h, p, sp, t = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4])
+t0 = time.monotonic()
+def done(rc, err=None):
+    print("%.1f" % ((time.monotonic() - t0) * 1000.0))
+    if err: sys.stderr.write("python3: %s\n" % err)
+    sys.exit(rc)
+try:
+    ai = socket.getaddrinfo(h, p, 0, socket.SOCK_STREAM)[0]
+    s = socket.socket(ai[0], socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.settimeout(t)
+    t0 = time.monotonic()
+    s.bind(("::" if ai[0] == socket.AF_INET6 else "0.0.0.0", sp))
+    s.connect(ai[4])
+    s.close()
+except socket.timeout:
+    done(1, "timed out")
+except OSError as e:
+    done(1, e.strerror or str(e))
+done(0)
+' "$HOST" "$PORT" "$sport" "$TIMEOUT_S"
+  else
+    perl -MIO::Socket::INET -e '
+my ($h, $p, $sp, $t) = @ARGV;
+my $hr = eval { require Time::HiRes; 1 };
+my $now = sub { $hr ? Time::HiRes::time() : time() };
+my $t0 = $now->();
+my $s = IO::Socket::INET->new(PeerAddr => $h, PeerPort => $p, LocalPort => $sp,
+                              ReuseAddr => 1, Proto => "tcp", Timeout => $t);
+printf "%.1f\n", ($now->() - $t0) * 1000 if $hr;
+if (!$s) { my $e = $@ || $!; print STDERR "perl: $e\n"; exit 1 }
+close $s; exit 0;
+' "$HOST" "$PORT" "$sport" "$TIMEOUT_S"
+  fi
+}
+
+# Short failure reason from the last nc/socat stderr line, e.g. "Connection refused".
 nc_fail_reason() {
   [[ -s "$NC_ERR" ]] || return 0
+  if grep -qiE "$NC_USAGE_RE|-e PROG" "$NC_ERR"; then
+    echo "$TCP_BIN rejected options (printed usage)"
+    return 0
+  fi
   tail -n 1 "$NC_ERR" | sed -e 's/.*: //' -e 's/[[:space:]]*$//'
 }
 
@@ -266,9 +327,22 @@ if nc_supports_z; then
 else
   [[ "$NO_DNS" -eq 1 ]] && echo "Warning: this nc has no -n; ignoring" >&2
 fi
-# -v: make nc report why a connect failed (shown next to FAILED)
-nc_supports_v && nc_args+=(-v)
 FAIL_REASONS=""
+if [[ "$UDP" -eq 0 ]]; then
+  # Probe-validate options against this nc build instead of trusting `nc -h`
+  nc_rejects "${nc_args[@]}" && die "this nc rejects options: ${nc_args[*]} (nc -h to check)"
+  # -v: make nc report why a connect failed (shown next to FAILED)
+  if nc_supports_v && ! nc_rejects "${nc_args[@]}" -v; then nc_args+=(-v); fi
+  if [[ -n "$SRC_BASE" ]] && nc_rejects "${nc_args[@]}" -p "$SRC_BASE"; then
+    # e.g. minimal BusyBox nc: -p only works with -l -> first available fallback wins
+    TCP_BIN=""
+    for c in socat python3 perl; do
+      if has_cmd "$c"; then TCP_BIN="$c"; break; fi
+    done
+    [[ -n "$TCP_BIN" ]] || die "this nc can't set a source port for outgoing connects (-s); need one of: socat, python3, perl, netcat-openbsd"
+    echo "Note: this nc can't bind a source port; using ${TCP_BIN} for -s" >&2
+  fi
+fi
 
 if [[ "$UDP" -eq 1 ]]; then
   echo "--- Starting UDP echo checks for ${HOST}:${PORT} (${COUNT} attempts, timeout ${TIMEOUT_S}s) ---"
@@ -286,11 +360,22 @@ for ((i=1; i<=COUNT; i++)); do
     connect_ms="$(run_udp_probe "$i" "$src_port")"
     rc=$?
   else
-    # -z (if supported): just scan/listen check (no data), -w: timeout, -p: fixed src port.
-    attempt_args=("${nc_args[@]}")
-    [[ -n "$src_port" ]] && attempt_args+=(-p "$src_port")
-    connect_ms="$(run_nc_timed "${attempt_args[@]}" "$HOST" "$PORT")"
-    rc=$?
+    if [[ "$TCP_BIN" == "socat" ]]; then
+      # connect from fixed src port, send nothing (/dev/null EOF), close
+      sc_host="$HOST"; [[ "$sc_host" == *:* && "$sc_host" != \[* ]] && sc_host="[$sc_host]"
+      connect_ms="$(run_nc_timed -T "$TIMEOUT_S" /dev/null \
+        "TCP:${sc_host}:${PORT},sourceport=${src_port},connect-timeout=${TIMEOUT_S}")"
+      rc=$?
+    elif [[ "$TCP_BIN" == "python3" || "$TCP_BIN" == "perl" ]]; then
+      connect_ms="$(probe_script "$src_port" 2>"$NC_ERR")"
+      rc=$?
+    else
+      # -z (if supported): just scan/listen check (no data), -w: timeout, -p: fixed src port.
+      attempt_args=("${nc_args[@]}")
+      [[ -n "$src_port" ]] && attempt_args+=(-p "$src_port")
+      connect_ms="$(run_nc_timed "${attempt_args[@]}" "$HOST" "$PORT")"
+      rc=$?
+    fi
   fi
   if [[ "$rc" -eq 0 ]]; then
     if [[ -n "$connect_ms" ]]; then
